@@ -14,7 +14,11 @@ prompt_yes_no_default_yes() {
   local prompt="$1"
   local ans=""
 
-  if [ -t 0 ]; then
+  # 关键：支持 `curl ... | bash` 这种场景（stdin 是 pipe），优先从 /dev/tty 读取
+  if [ -e /dev/tty ] && [ -t 1 ]; then
+    # shellcheck disable=SC2162
+    read -r -p "${prompt} [Y/n]: " ans < /dev/tty || true
+  elif [ -t 0 ]; then
     read -r -p "${prompt} [Y/n]: " ans || true
   else
     # 非交互环境：默认 yes
@@ -118,6 +122,15 @@ get_installed_anytls_version() {
   local p out v
   p="$(get_installed_anytls_path)" || return 1
 
+  # 优先读取脚本维护的版本文件（避免二进制本身不支持 version flag）
+  if [ -f /root/anytls/.anytls_version ]; then
+    v="$(cat /root/anytls/.anytls_version 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$v" ]; then
+      echo "$v"
+      return 0
+    fi
+  fi
+
   out="$("$p" -v 2>/dev/null || true)"
   v="$(extract_semver "$out")"
   if [ -n "$v" ]; then
@@ -141,6 +154,30 @@ get_installed_anytls_version() {
 
   echo "unknown"
   return 0
+}
+
+find_anytls_service_unit() {
+  # best-effort: find a systemd unit that runs anytls-server
+  if [ -f /etc/systemd/system/anytls.service ] || [ -f /lib/systemd/system/anytls.service ]; then
+    echo "anytls.service"
+    return 0
+  fi
+  if systemctl list-unit-files 2>/dev/null | grep -q '^anytls\.service'; then
+    echo "anytls.service"
+    return 0
+  fi
+
+  # search common unit dirs for ExecStart containing anytls-server
+  local f base
+  for f in /etc/systemd/system/*.service /lib/systemd/system/*.service /usr/lib/systemd/system/*.service; do
+    [ -f "$f" ] || continue
+    if grep -qsE '^[[:space:]]*ExecStart=.*anytls-server' "$f"; then
+      base="$(basename "$f")"
+      echo "$base"
+      return 0
+    fi
+  done
+  return 1
 }
 
 detect_arch() {
@@ -206,14 +243,20 @@ if get_installed_anytls_path >/dev/null 2>&1; then
 
   mv -f "${TMP_DIR}/anytls-server" /root/anytls/anytls-server
   chmod +x /root/anytls/anytls-server
+  echo "${LATEST_VERSION}" > /root/anytls/.anytls_version
 
   echo "Upgrade completed. Restarting service..."
-  if systemctl list-unit-files | grep -q '^anytls\.service'; then
-    systemctl restart anytls.service
-    systemctl --no-pager --full status anytls.service || true
-    echo "AnyTLS upgraded and service restarted."
+  if command -v systemctl >/dev/null 2>&1; then
+    if UNIT_NAME="$(find_anytls_service_unit)"; then
+      systemctl daemon-reload || true
+      systemctl restart "$UNIT_NAME"
+      systemctl --no-pager --full status "$UNIT_NAME" || true
+      echo "AnyTLS upgraded and service restarted: ${UNIT_NAME}"
+    else
+      echo "Note: no systemd service unit found for anytls-server; binary upgraded at /root/anytls/anytls-server."
+    fi
   else
-    echo "Warning: anytls.service not found. Binary upgraded at /root/anytls/anytls-server."
+    echo "Note: systemctl not available; binary upgraded at /root/anytls/anytls-server."
   fi
 
   exit 0
@@ -245,6 +288,7 @@ unzip -o "$ANYTLS_ZIP"
 echo "Making AnyTLS server executable..."
 chmod +x anytls-server
 echo "Creating systemd service file..."
+echo "${LATEST_VERSION}" > /root/anytls/.anytls_version
 
 # 生成随机密码
 RANDOM_PASSWORD=$(openssl rand -base64 12 | tr -d "=+/" | cut -c1-16)
